@@ -39,7 +39,15 @@ os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", "4096")
 
 from anthropic import Anthropic  # noqa: E402
 from langfuse import Langfuse, get_client, observe  # noqa: E402
-from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor  # noqa: E402
+
+try:
+    from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor  # noqa: E402
+    _ANTHROPIC_INSTRUMENTOR_AVAILABLE = True
+    _ANTHROPIC_INSTRUMENTOR_ERROR: str | None = None
+except Exception as _e:
+    AnthropicInstrumentor = None  # type: ignore
+    _ANTHROPIC_INSTRUMENTOR_AVAILABLE = False
+    _ANTHROPIC_INSTRUMENTOR_ERROR = f"{type(_e).__name__}: {_e}"
 
 from tools import TOOL_REGISTRY, TOOL_SCHEMA  # noqa: E402
 
@@ -125,8 +133,8 @@ def init_langfuse_session(public_key: str, secret_key: str, host_choice: str,
     os.environ["LANGFUSE_HOST"] = resolved
     os.environ["LANGFUSE_TRACING_ENVIRONMENT"] = ENVIRONMENT
 
-    # (Re)initialise — Langfuse v3 caches the singleton, but constructing
-    # again with new creds updates the active config.
+    # (Re)initialise — Langfuse v3 caches by public_key; this registers the
+    # client for our credentials so subsequent get_client(public_key=...) finds it.
     Langfuse(
         public_key=public_key,
         secret_key=secret_key,
@@ -134,20 +142,31 @@ def init_langfuse_session(public_key: str, secret_key: str, host_choice: str,
         timeout=30,
     )
 
-    # Instrument Anthropic once per process.
-    if not st.session_state.get("_anthropic_instrumented"):
+    # Instrument Anthropic once per process (if the package is available).
+    if _ANTHROPIC_INSTRUMENTOR_AVAILABLE and not st.session_state.get("_anthropic_instrumented"):
         try:
             AnthropicInstrumentor().instrument()
             st.session_state["_anthropic_instrumented"] = True
         except Exception as e:
             return False, f"Anthropic instrumentation failed: {e}"
 
-    # Final sanity check using the SDK client.
-    client = get_client()
-    if not client.auth_check():
-        return False, "SDK auth_check failed after init"
+    # NOTE: we deliberately skip client.auth_check() here — the v3 singleton can
+    # return a stale client from before our re-init, causing a spurious 401.
+    # The HTTP probe above already validated the credentials.
+
+    # Remember the credential pair so per-request lookups use the right client.
+    st.session_state["_lf_public_key"] = public_key
 
     return True, resolved
+
+
+def lf_client():
+    """Return the Langfuse client for the currently-connected attendee."""
+    pk = st.session_state.get("_lf_public_key")
+    try:
+        return get_client(public_key=pk) if pk else get_client()
+    except Exception:
+        return get_client()
 
 
 # --- Agent loop -------------------------------------------------------------
@@ -218,7 +237,7 @@ def _run_tool(name: str, args: dict, registry: dict) -> dict:
         update_kwargs["status_message"] = f"{error_kind}: {error_message}"
 
     try:
-        get_client().update_current_span(**update_kwargs)
+        lf_client().update_current_span(**update_kwargs)
     except Exception as upd_exc:
         # Don't swallow silently — surface in stdout so it shows up in Streamlit Cloud logs.
         print(f"[langfuse] update_current_span failed: {upd_exc}")
@@ -244,7 +263,7 @@ def run_agent(
     enabled_tools: list[str],
 ) -> dict:
     client = get_anthropic_client()
-    lf = get_client()
+    lf = lf_client()
     tool_schema = [t for t in TOOL_SCHEMA if t["name"] in enabled_tools]
     tool_registry = {k: v for k, v in TOOL_REGISTRY.items() if k in enabled_tools}
 
@@ -380,6 +399,14 @@ def run_agent(
 st.set_page_config(page_title="Langfuse Tracing Workshop", page_icon="🔎", layout="wide")
 st.title("🔎 Langfuse Tracing Workshop")
 st.caption("Claude + tool calling, traced into your own Langfuse account.")
+
+if not _ANTHROPIC_INSTRUMENTOR_AVAILABLE:
+    st.warning(
+        "⚠️ `opentelemetry-instrumentation-anthropic` is not installed in this "
+        "deployment, so Anthropic LLM calls won't auto-trace. Tool spans and "
+        f"the chat-turn root span will still be logged.  \n_Detail: {_ANTHROPIC_INSTRUMENTOR_ERROR}_  \n"
+        "**Fix:** redeploy after a clean reinstall (Streamlit Cloud → Manage app → ⋯ → Reboot)."
+    )
 
 ss = st.session_state
 ss.setdefault("session_id", f"sess-{uuid.uuid4().hex[:12]}")
@@ -544,7 +571,7 @@ if prompt:
                 st.stop()
             finally:
                 try:
-                    get_client().flush()
+                    lf_client().flush()
                 except Exception:
                     pass
 
