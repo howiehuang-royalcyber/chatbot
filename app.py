@@ -99,9 +99,29 @@ def build_langfuse(public_key: str, secret_key: str, host: str) -> Langfuse:
     return Langfuse(public_key=public_key, secret_key=secret_key, host=host)
 
 
+def _probe_host(public_key: str, secret_key: str, host: str) -> tuple[bool, str]:
+    """Plain HTTP credential check — does NOT instantiate the Langfuse SDK."""
+    import urllib.request
+    import urllib.error
+    import base64
+
+    token = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+    req = urllib.request.Request(
+        f"{host.rstrip('/')}/api/public/projects",
+        headers={"Authorization": f"Basic {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return (200 <= resp.status < 300), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def connect_langfuse(public_key: str, secret_key: str, host_choice: str,
                      custom_host: str) -> tuple[Langfuse | None, str | None, str | None]:
-    """Try the chosen host first, then auto-fall-back to the other cloud region.
+    """Probe each candidate host via HTTP; only instantiate Langfuse for the winner.
 
     Returns (client, host_used, error_message).
     """
@@ -110,20 +130,19 @@ def connect_langfuse(public_key: str, secret_key: str, host_choice: str,
     elif host_choice == "Auto-detect":
         candidates = list(LANGFUSE_HOSTS)
     else:
-        # Try selected first, then the other cloud region as a fallback.
         candidates = [host_choice] + [h for h in LANGFUSE_HOSTS if h != host_choice]
 
     last_error: str | None = None
     for host in candidates:
         if not host:
             continue
-        try:
-            lf = build_langfuse(public_key, secret_key, host)
-            if lf.auth_check():
-                return lf, host, None
-            last_error = "Invalid credentials for this host."
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+        ok, detail = _probe_host(public_key, secret_key, host)
+        if ok:
+            try:
+                return build_langfuse(public_key, secret_key, host), host, None
+            except Exception as exc:
+                return None, None, f"Probe OK but SDK init failed: {exc}"
+        last_error = f"{host} → {detail}"
     return None, None, last_error or "No host candidates to try."
 
 
