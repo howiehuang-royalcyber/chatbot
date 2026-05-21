@@ -1,41 +1,18 @@
-"""Streamlit demo: Claude + tool calling with rich Langfuse tracing.
+"""Streamlit demo: Claude + tool calling with Langfuse tracing.
 
-Workshop layout: one hosted Streamlit app. Each attendee enters their own
-Langfuse credentials in the sidebar — their traces go to their own Langfuse
-account so they can build LLM-as-a-judge evaluators against real data they
-just produced.
+Pattern proven in production at GTP-Rag-System:
+- Langfuse v3 SDK initialized ONCE per process with OTel batch tuning.
+- AnthropicInstrumentor auto-captures every Anthropic SDK call (tokens,
+  model, latency) as a generation span.
+- @observe wraps custom functions (chat-turn root span, per-tool spans).
+- propagate_attributes attaches session_id / user_id / metadata / tags to
+  the current trace.
 
-The Anthropic key is supplied by the host via Streamlit secrets, with a
-per-session rate limit to control cost.
-
-Stable JSON shape (per trace) — predictable paths for downstream evaluators:
-
-  trace.input  = {"user_message": str, "history_turns": int}
-  trace.output = {"reply": str, "stop_reason": str}
-  trace.metadata = {
-      "app":      {"name", "version", "environment"},
-      "session":  {"id"},
-      "user":     {"id", "tier", "locale", "channel"},
-      "request":  {"id"},
-      "model":    {"name", "temperature", "max_tokens"},
-      "system_prompt": str,
-      "summary":  {"llm_calls", "tool_calls", "tool_errors",
-                   "input_tokens", "output_tokens", "latency_ms",
-                   "stopped_because"},
-      "tools_used": [
-          {"name", "input": {...}, "output": {...}, "ok": bool, "latency_ms"}
-      ],
-  }
-
-  generation.input  = {"system": str, "messages": [...]}
-  generation.output = {"blocks": [...]}
-  generation.metadata = {"iteration", "stop_reason", "response_id",
-                         "latency_ms", "model_returned",
-                         "tools_available": [...]}
-
-  tool_span.input  = {"args": {...}}
-  tool_span.output = {"result": {...}, "ok": bool}
-  tool_span.metadata = {"tool_name", "tool_kind", "latency_ms", "ok"}
+Multi-tenant note for the workshop: the Langfuse client + OTel tracer
+provider are process-global, so the "currently active" Langfuse account is
+whoever clicked Connect last. For simultaneous attendees, each should run
+their own copy. For a single-presenter workshop with one shared hosted app,
+this is fine.
 """
 from __future__ import annotations
 
@@ -48,12 +25,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Host-provided secret on Streamlit Cloud (and locally via .env).
-if "ANTHROPIC_API_KEY" in st.secrets and not os.environ.get("ANTHROPIC_API_KEY"):
-    os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
+try:
+    if "ANTHROPIC_API_KEY" in st.secrets and not os.environ.get("ANTHROPIC_API_KEY"):
+        os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
+except Exception:
+    pass
+
+# IMPORTANT: set OTel batch env vars BEFORE importing langfuse, so they apply
+# the very first time the tracer provider initialises.
+os.environ.setdefault("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "32")
+os.environ.setdefault("OTEL_BSP_SCHEDULE_DELAY_MILLIS", "2000")
+os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", "4096")
 
 from anthropic import Anthropic  # noqa: E402
-from langfuse import Langfuse    # noqa: E402
+from langfuse import Langfuse, get_client, observe  # noqa: E402
+from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor  # noqa: E402
 
 from tools import TOOL_REGISTRY, TOOL_SCHEMA  # noqa: E402
 
@@ -63,22 +49,23 @@ from tools import TOOL_REGISTRY, TOOL_SCHEMA  # noqa: E402
 APP_NAME = "rc-support-bot"
 APP_VERSION = "0.1.0"
 ENVIRONMENT = os.environ.get("APP_ENV", "workshop")
-
+LANGFUSE_HOSTS = [
+    "https://cloud.langfuse.com",
+    "https://us.cloud.langfuse.com",
+]
 AVAILABLE_MODELS = [
     "claude-sonnet-4-5",
     "claude-opus-4-5",
     "claude-haiku-4-5",
 ]
-
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful customer-support assistant for an electronics retailer. "
     "Use the provided tools to answer questions about orders, products, pricing "
     "and discounts. Always cite the values returned by tools rather than guessing. "
     "Keep replies concise and friendly."
 )
-
 MAX_TOOL_ITERATIONS = 5
-SESSION_MESSAGE_LIMIT = 25  # per-attendee cost guardrail
+SESSION_MESSAGE_LIMIT = 25
 
 
 @st.cache_resource
@@ -86,25 +73,10 @@ def get_anthropic_client() -> Anthropic:
     return Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
-# --- Per-session Langfuse client -------------------------------------------
-
-LANGFUSE_HOSTS = [
-    "https://cloud.langfuse.com",
-    "https://us.cloud.langfuse.com",
-]
-
-
-def build_langfuse(public_key: str, secret_key: str, host: str) -> Langfuse:
-    """Instantiate a Langfuse client scoped to this attendee's credentials."""
-    return Langfuse(public_key=public_key, secret_key=secret_key, host=host)
-
+# --- Langfuse init ----------------------------------------------------------
 
 def _probe_host(public_key: str, secret_key: str, host: str) -> tuple[bool, str]:
-    """Plain HTTP credential check — does NOT instantiate the Langfuse SDK."""
-    import urllib.request
-    import urllib.error
-    import base64
-
+    import urllib.request, urllib.error, base64
     token = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
     req = urllib.request.Request(
         f"{host.rstrip('/')}/api/public/projects",
@@ -119,11 +91,12 @@ def _probe_host(public_key: str, secret_key: str, host: str) -> tuple[bool, str]
         return False, f"{type(e).__name__}: {e}"
 
 
-def connect_langfuse(public_key: str, secret_key: str, host_choice: str,
-                     custom_host: str) -> tuple[Langfuse | None, str | None, str | None]:
-    """Probe each candidate host via HTTP; only instantiate Langfuse for the winner.
+def init_langfuse_session(public_key: str, secret_key: str, host_choice: str,
+                          custom_host: str) -> tuple[bool, str]:
+    """Validate creds via HTTP, then (re)configure the global Langfuse client.
 
-    Returns (client, host_used, error_message).
+    Returns (ok, message). On success the global langfuse client points at
+    the resolved host and the Anthropic instrumentor is active.
     """
     if host_choice == "Other / self-hosted":
         candidates = [custom_host.strip()] if custom_host else []
@@ -132,67 +105,134 @@ def connect_langfuse(public_key: str, secret_key: str, host_choice: str,
     else:
         candidates = [host_choice] + [h for h in LANGFUSE_HOSTS if h != host_choice]
 
-    last_error: str | None = None
-    for host in candidates:
-        if not host:
+    resolved = None
+    last = "no candidates"
+    for h in candidates:
+        if not h:
             continue
-        ok, detail = _probe_host(public_key, secret_key, host)
+        ok, detail = _probe_host(public_key, secret_key, h)
         if ok:
-            try:
-                return build_langfuse(public_key, secret_key, host), host, None
-            except Exception as exc:
-                return None, None, f"Probe OK but SDK init failed: {exc}"
-        last_error = f"{host} → {detail}"
-    return None, None, last_error or "No host candidates to try."
+            resolved = h
+            break
+        last = f"{h} → {detail}"
+    if resolved is None:
+        return False, last
 
+    # Push creds into env so Langfuse picks them up and so any later
+    # `get_client()` returns a client pointing at the right host.
+    os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
+    os.environ["LANGFUSE_SECRET_KEY"] = secret_key
+    os.environ["LANGFUSE_HOST"] = resolved
+    os.environ["LANGFUSE_TRACING_ENVIRONMENT"] = ENVIRONMENT
 
-def trace_url(langfuse: Langfuse | None, host: str, trace_id: str) -> str:
-    """Use the SDK helper so we get the correct /project/<id>/traces/<id> URL."""
-    if langfuse is not None:
+    # (Re)initialise — Langfuse v3 caches the singleton, but constructing
+    # again with new creds updates the active config.
+    Langfuse(
+        public_key=public_key,
+        secret_key=secret_key,
+        host=resolved,
+        timeout=30,
+    )
+
+    # Instrument Anthropic once per process.
+    if not st.session_state.get("_anthropic_instrumented"):
         try:
-            url = langfuse.get_trace_url(trace_id=trace_id)
-            if url:
-                return url
-        except Exception:
-            pass
-    return f"{host.rstrip('/')}/project/_/traces/{trace_id}"
+            AnthropicInstrumentor().instrument()
+            st.session_state["_anthropic_instrumented"] = True
+        except Exception as e:
+            return False, f"Anthropic instrumentation failed: {e}"
+
+    # Final sanity check using the SDK client.
+    client = get_client()
+    if not client.auth_check():
+        return False, "SDK auth_check failed after init"
+
+    return True, resolved
 
 
 # --- Agent loop -------------------------------------------------------------
 
-def _run_tool(langfuse: Langfuse, name: str, args: dict, registry: dict) -> dict:
+@observe(name="tool-call")
+def _run_tool(name: str, args: dict, registry: dict) -> dict:
+    import traceback
     started = time.perf_counter()
-    with langfuse.start_as_current_span(
-        name=f"tool:{name}",
-        input={"args": args},
-        metadata={"tool_name": name, "tool_kind": "function"},
-    ) as span:
-        fn = registry.get(name)
-        ok = True
-        if fn is None:
-            result = {"error": f"Unknown or disabled tool '{name}'."}
-            ok = False
-        else:
-            try:
-                result = fn(**args)
-                if isinstance(result, dict) and "error" in result:
-                    ok = False
-            except Exception as exc:
-                result = {"error": f"{type(exc).__name__}: {exc}"}
+    fn = registry.get(name)
+    ok = True
+    error_kind: str | None = None
+    error_message: str | None = None
+    error_traceback: str | None = None
+
+    if fn is None:
+        result = {"error": f"Unknown or disabled tool '{name}'."}
+        ok = False
+        error_kind = "UnknownTool"
+        error_message = result["error"]
+    else:
+        try:
+            result = fn(**args)
+            if isinstance(result, dict) and "error" in result:
+                # Tool ran but returned a domain-level error (e.g. "order not found").
+                # We treat that as a WARNING, not ERROR — useful signal but not a bug.
                 ok = False
-        latency_ms = round((time.perf_counter() - started) * 1000, 2)
-        span.update(
-            output={"result": result, "ok": ok},
-            metadata={"tool_name": name, "tool_kind": "function",
-                      "latency_ms": latency_ms, "ok": ok},
-            level="ERROR" if not ok else "DEFAULT",
-        )
-    return {"name": name, "input": args, "output": result, "ok": ok, "latency_ms": latency_ms}
+                error_kind = "ToolReturnedError"
+                error_message = str(result.get("error"))
+        except Exception as exc:
+            result = {"error": f"{type(exc).__name__}: {exc}"}
+            ok = False
+            error_kind = type(exc).__name__
+            error_message = str(exc)
+            error_traceback = traceback.format_exc()
+
+    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+
+    # Choose level: real exceptions are ERROR, domain errors (tool returned
+    # {"error": ...}) are WARNING, success is unset (DEFAULT).
+    if error_traceback is not None:
+        level = "ERROR"
+    elif error_kind:
+        level = "WARNING"
+    else:
+        level = None
+
+    span_metadata = {
+        "tool_name": name,
+        "tool_kind": "function",
+        "latency_ms": latency_ms,
+        "ok": ok,
+    }
+    if error_kind:
+        span_metadata["error"] = {
+            "kind": error_kind,
+            "message": error_message,
+            "traceback": error_traceback,
+        }
+
+    update_kwargs = {
+        "name": f"tool:{name}",
+        "input": {"args": args},
+        "output": {"result": result, "ok": ok},
+        "metadata": span_metadata,
+    }
+    if level is not None:
+        update_kwargs["level"] = level
+        update_kwargs["status_message"] = f"{error_kind}: {error_message}"
+
+    try:
+        get_client().update_current_span(**update_kwargs)
+    except Exception as upd_exc:
+        # Don't swallow silently — surface in stdout so it shows up in Streamlit Cloud logs.
+        print(f"[langfuse] update_current_span failed: {upd_exc}")
+
+    return {
+        "name": name, "input": args, "output": result, "ok": ok,
+        "latency_ms": latency_ms,
+        "error": ({"kind": error_kind, "message": error_message} if error_kind else None),
+    }
 
 
+@observe(name="chat-turn")
 def run_agent(
     *,
-    langfuse: Langfuse,
     user_message: str,
     history: list[dict],
     session_id: str,
@@ -203,8 +243,8 @@ def run_agent(
     model_params: dict,
     enabled_tools: list[str],
 ) -> dict:
-    """One chat turn. Creates a root trace via a chat-turn span."""
     client = get_anthropic_client()
+    lf = get_client()
     tool_schema = [t for t in TOOL_SCHEMA if t["name"] in enabled_tools]
     tool_registry = {k: v for k, v in TOOL_REGISTRY.items() if k in enabled_tools}
 
@@ -222,73 +262,51 @@ def run_agent(
         "model": {"name": model, **model_params},
         "system_prompt": system_prompt,
     }
+    tags = [
+        f"env:{ENVIRONMENT}",
+        f"app:{APP_NAME}",
+        f"model:{model}",
+        f"tier:{user_attrs.get('customer_tier', 'unknown')}",
+        f"channel:{user_attrs.get('channel', 'web')}",
+        f"locale:{user_attrs.get('locale', 'unknown')}",
+    ]
 
-    messages = history + [{"role": "user", "content": user_message}]
-    tools_used: list[dict] = []
-    tool_errors = 0
-    turn_started = time.perf_counter()
-    total_input_tokens = 0
-    total_output_tokens = 0
-    llm_calls = 0
-    final_text = ""
-    stop_reason = "max_iterations"
-
-    with langfuse.start_as_current_span(
-        name="chat-turn",
+    # Set trace-level attributes early so they apply to all child spans.
+    lf.update_current_trace(
+        name="customer-support-turn",
+        session_id=session_id,
+        user_id=user_id,
+        tags=tags,
         input={"user_message": user_message, "history_turns": len(history) // 2},
         metadata=base_metadata,
-    ) as root:
-        trace_id = langfuse.get_current_trace_id()
-        langfuse.update_current_trace(
-            name="customer-support-turn",
-            session_id=session_id,
-            user_id=user_id,
-            input={"user_message": user_message, "history_turns": len(history) // 2},
-            tags=[
-                f"env:{ENVIRONMENT}",
-                f"app:{APP_NAME}",
-                f"model:{model}",
-                f"tier:{user_attrs.get('customer_tier', 'unknown')}",
-                f"channel:{user_attrs.get('channel', 'web')}",
-                f"locale:{user_attrs.get('locale', 'unknown')}",
-            ],
-            metadata=base_metadata,
-        )
+    )
+    lf.update_current_span(
+        input={"user_message": user_message, "history_turns": len(history) // 2},
+        metadata=base_metadata,
+    )
+    if True:
+
+        messages = history + [{"role": "user", "content": user_message}]
+        tools_used: list[dict] = []
+        tool_errors = 0
+        turn_started = time.perf_counter()
+        total_input_tokens = 0
+        total_output_tokens = 0
+        llm_calls = 0
+        final_text = ""
+        stop_reason = "max_iterations"
 
         for iteration in range(MAX_TOOL_ITERATIONS):
-            gen_started = time.perf_counter()
-            with langfuse.start_as_current_generation(
-                name="anthropic.messages.create",
+            response = client.messages.create(
                 model=model,
-                model_parameters=model_params,
-                input={"system": system_prompt, "messages": messages},
-                metadata={"iteration": iteration,
-                          "tools_available": [t["name"] for t in tool_schema]},
-            ) as gen:
-                response = client.messages.create(
-                    model=model,
-                    system=system_prompt,
-                    tools=tool_schema,
-                    messages=messages,
-                    **model_params,
-                )
-                latency_ms = round((time.perf_counter() - gen_started) * 1000, 2)
-                llm_calls += 1
-                total_input_tokens += response.usage.input_tokens
-                total_output_tokens += response.usage.output_tokens
-                gen.update(
-                    output={"blocks": [b.model_dump() for b in response.content]},
-                    usage_details={"input": response.usage.input_tokens,
-                                   "output": response.usage.output_tokens},
-                    metadata={
-                        "iteration": iteration,
-                        "tools_available": [t["name"] for t in tool_schema],
-                        "stop_reason": response.stop_reason,
-                        "response_id": response.id,
-                        "latency_ms": latency_ms,
-                        "model_returned": response.model,
-                    },
-                )
+                system=system_prompt,
+                tools=tool_schema,
+                messages=messages,
+                **model_params,
+            )
+            llm_calls += 1
+            total_input_tokens += response.usage.input_tokens
+            total_output_tokens += response.usage.output_tokens
 
             messages.append({"role": "assistant",
                              "content": [b.model_dump() for b in response.content]})
@@ -302,7 +320,7 @@ def run_agent(
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                record = _run_tool(langfuse, block.name, block.input, tool_registry)
+                record = _run_tool(block.name, block.input, tool_registry)
                 if not record["ok"]:
                     tool_errors += 1
                 tools_used.append(record)
@@ -327,19 +345,30 @@ def run_agent(
             "stopped_because": stop_reason,
         }
         full_metadata = {**base_metadata, "summary": summary, "tools_used": tools_used}
-        root.update(
+        lf.update_current_span(
             output={"reply": final_text, "stop_reason": stop_reason},
             metadata=full_metadata,
         )
-        langfuse.update_current_trace(
+        lf.update_current_trace(
+            name="customer-support-turn",
+            input={"user_message": user_message, "history_turns": len(history) // 2},
             output={"reply": final_text, "stop_reason": stop_reason},
             metadata=full_metadata,
+            session_id=session_id,
+            user_id=user_id,
+            tags=tags,
         )
+        trace_id = lf.get_current_trace_id()
+        try:
+            url = lf.get_trace_url(trace_id=trace_id)
+        except Exception:
+            url = None
 
     return {
         "reply": final_text,
         "tools_used": tools_used,
         "trace_id": trace_id,
+        "trace_url": url,
         "latency_ms": turn_latency,
         "tokens": {"input": total_input_tokens, "output": total_output_tokens},
         "stop_reason": stop_reason,
@@ -350,24 +379,22 @@ def run_agent(
 
 st.set_page_config(page_title="Langfuse Tracing Workshop", page_icon="🔎", layout="wide")
 st.title("🔎 Langfuse Tracing Workshop")
-st.caption("Each attendee uses their own Langfuse account. The host supplies the Claude API key.")
+st.caption("Claude + tool calling, traced into your own Langfuse account.")
 
-# --- Session state defaults ---
 ss = st.session_state
 ss.setdefault("session_id", f"sess-{uuid.uuid4().hex[:12]}")
 ss.setdefault("attendee_suffix", uuid.uuid4().hex[:6])
 ss.setdefault("history", [])
 ss.setdefault("display", [])
 ss.setdefault("message_count", 0)
-ss.setdefault("langfuse", None)
-ss.setdefault("langfuse_host", "https://cloud.langfuse.com")
+ss.setdefault("langfuse_ready", False)
+ss.setdefault("langfuse_host", "")
 ss.setdefault("system_prompt", DEFAULT_SYSTEM_PROMPT)
 ss.setdefault("model", AVAILABLE_MODELS[0])
 ss.setdefault("temperature", 0.2)
 ss.setdefault("max_tokens", 1024)
 ss.setdefault("enabled_tools", [t["name"] for t in TOOL_SCHEMA])
 
-# --- Sidebar: Langfuse connection ---
 with st.sidebar:
     st.subheader("1️⃣ Connect your Langfuse account")
     st.caption("Get keys at Langfuse → Settings → API Keys")
@@ -375,14 +402,11 @@ with st.sidebar:
     host_choice = st.selectbox(
         "Langfuse region",
         ["Auto-detect", "https://cloud.langfuse.com", "https://us.cloud.langfuse.com", "Other / self-hosted"],
-        index=0,
-        key="host_choice",
+        index=0, key="host_choice",
         help="Auto-detect tries both EU and US Langfuse Cloud regions.",
     )
-    if host_choice == "Other / self-hosted":
-        custom_host = st.text_input("Langfuse host", value=ss.langfuse_host, key="custom_host")
-    else:
-        custom_host = ""
+    custom_host = st.text_input("Langfuse host", value="", key="custom_host") \
+        if host_choice == "Other / self-hosted" else ""
 
     pk = st.text_input("Public key (pk-lf-…)", type="password", key="pk_input")
     sk = st.text_input("Secret key (sk-lf-…)", type="password", key="sk_input")
@@ -392,30 +416,26 @@ with st.sidebar:
         if not (pk and sk):
             st.error("Both keys are required.")
         else:
-            lf, host_used, err = connect_langfuse(pk.strip(), sk.strip(), host_choice, custom_host)
-            if lf is None:
-                st.error(f"Could not connect: {err}")
+            ok, info = init_langfuse_session(pk.strip(), sk.strip(), host_choice, custom_host)
+            if ok:
+                ss.langfuse_ready = True
+                ss.langfuse_host = info
+                st.success(f"Connected ✅ ({info})")
             else:
-                ss.langfuse = lf
-                ss.langfuse_host = host_used
-                st.success(f"Connected ✅ ({host_used})")
+                ss.langfuse_ready = False
+                st.error(f"Could not connect: {info}")
     if col_b.button("Disconnect", use_container_width=True):
-        ss.langfuse = None
+        ss.langfuse_ready = False
         st.rerun()
 
-    if ss.langfuse:
+    if ss.langfuse_ready:
         st.success(f"Connected to {ss.langfuse_host}")
     else:
         st.warning("Not connected — traces will not be recorded.")
 
     st.divider()
     st.subheader("2️⃣ Configure the agent")
-    ss.system_prompt = st.text_area(
-        "System prompt",
-        value=ss.system_prompt,
-        height=180,
-        help="This is sent as the system message on every turn.",
-    )
+    ss.system_prompt = st.text_area("System prompt", value=ss.system_prompt, height=180)
     if st.button("Reset to default prompt"):
         ss.system_prompt = DEFAULT_SYSTEM_PROMPT
         st.rerun()
@@ -424,16 +444,14 @@ with st.sidebar:
                             index=AVAILABLE_MODELS.index(ss.model))
     ss.temperature = st.slider("Temperature", 0.0, 1.0, ss.temperature, 0.05)
     ss.max_tokens = st.slider("Max tokens", 256, 4096, ss.max_tokens, 64)
-
     ss.enabled_tools = st.multiselect(
         "Tools available to the agent",
         options=[t["name"] for t in TOOL_SCHEMA],
         default=ss.enabled_tools,
-        help="Disable a tool to see how the agent copes without it.",
     )
 
     st.divider()
-    st.subheader("3️⃣ Your identity (logged to your Langfuse)")
+    st.subheader("3️⃣ Your identity (logged to Langfuse)")
     user_id = st.text_input("User id", value=f"attendee-{ss.attendee_suffix}")
     customer_tier = st.selectbox("Customer tier", ["free", "pro", "enterprise"], index=1)
     locale = st.selectbox("Locale", ["en-US", "en-GB", "de-DE", "ja-JP"], index=0)
@@ -450,7 +468,6 @@ with st.sidebar:
         ss.message_count = 0
         st.rerun()
 
-    st.divider()
     with st.expander("Try asking…"):
         st.markdown(
             "- *What's the status of order ORD-1001?*\n"
@@ -480,9 +497,10 @@ def render_assistant_turn(turn: dict) -> None:
                 st.json({"input": t["input"], "output": t["output"]})
 
     tid = turn.get("trace_id")
-    host = turn.get("trace_host")
-    if tid and host:
-        st.caption(f"trace `{tid}` — [open in Langfuse]({trace_url(ss.langfuse, host, tid)})")
+    url = turn.get("trace_url")
+    if tid:
+        link = f" — [open in Langfuse]({url})" if url else ""
+        st.caption(f"trace `{tid}`" + link)
 
 
 for turn in ss.display:
@@ -492,19 +510,15 @@ for turn in ss.display:
         else:
             st.markdown(turn["text"])
 
-
-# --- Chat input ---
 prompt = st.chat_input(
     "Ask about an order, product, or discount…",
-    disabled=(ss.langfuse is None or ss.message_count >= SESSION_MESSAGE_LIMIT
-              or not ss.enabled_tools and False),  # tools optional
+    disabled=(not ss.langfuse_ready or ss.message_count >= SESSION_MESSAGE_LIMIT),
 )
 
-if ss.langfuse is None:
+if not ss.langfuse_ready:
     st.info("👈 Connect your Langfuse account in the sidebar to start chatting.")
 elif ss.message_count >= SESSION_MESSAGE_LIMIT:
-    st.warning(f"Per-session message limit ({SESSION_MESSAGE_LIMIT}) reached. "
-               f"Use **Reset conversation** in the sidebar to start a new session.")
+    st.warning(f"Per-session message limit ({SESSION_MESSAGE_LIMIT}) reached.")
 
 if prompt:
     ss.display.append({"role": "user", "text": prompt})
@@ -515,7 +529,6 @@ if prompt:
         with st.spinner("Thinking…"):
             try:
                 result = run_agent(
-                    langfuse=ss.langfuse,
                     user_message=prompt,
                     history=ss.history,
                     session_id=ss.session_id,
@@ -530,8 +543,10 @@ if prompt:
                 st.error(f"Error: {exc}")
                 st.stop()
             finally:
-                if ss.langfuse:
-                    ss.langfuse.flush()
+                try:
+                    get_client().flush()
+                except Exception:
+                    pass
 
         ss.message_count += 1
         ss.history.append({"role": "user", "content": prompt})
@@ -541,7 +556,7 @@ if prompt:
             "text": result["reply"],
             "tools": result["tools_used"],
             "trace_id": result["trace_id"],
-            "trace_host": ss.langfuse_host,
+            "trace_url": result.get("trace_url"),
             "latency_ms": result["latency_ms"],
             "tokens": result["tokens"],
         })
