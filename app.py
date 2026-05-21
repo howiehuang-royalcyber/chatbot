@@ -88,9 +88,43 @@ def get_anthropic_client() -> Anthropic:
 
 # --- Per-session Langfuse client -------------------------------------------
 
+LANGFUSE_HOSTS = [
+    "https://cloud.langfuse.com",
+    "https://us.cloud.langfuse.com",
+]
+
+
 def build_langfuse(public_key: str, secret_key: str, host: str) -> Langfuse:
     """Instantiate a Langfuse client scoped to this attendee's credentials."""
     return Langfuse(public_key=public_key, secret_key=secret_key, host=host)
+
+
+def connect_langfuse(public_key: str, secret_key: str, host_choice: str,
+                     custom_host: str) -> tuple[Langfuse | None, str | None, str | None]:
+    """Try the chosen host first, then auto-fall-back to the other cloud region.
+
+    Returns (client, host_used, error_message).
+    """
+    if host_choice == "Other / self-hosted":
+        candidates = [custom_host.strip()] if custom_host else []
+    elif host_choice == "Auto-detect":
+        candidates = list(LANGFUSE_HOSTS)
+    else:
+        # Try selected first, then the other cloud region as a fallback.
+        candidates = [host_choice] + [h for h in LANGFUSE_HOSTS if h != host_choice]
+
+    last_error: str | None = None
+    for host in candidates:
+        if not host:
+            continue
+        try:
+            lf = build_langfuse(public_key, secret_key, host)
+            if lf.auth_check():
+                return lf, host, None
+            last_error = "Invalid credentials for this host."
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+    return None, None, last_error or "No host candidates to try."
 
 
 def trace_url(host: str, trace_id: str) -> str:
@@ -313,32 +347,31 @@ with st.sidebar:
 
     host_choice = st.selectbox(
         "Langfuse region",
-        ["https://cloud.langfuse.com", "https://us.cloud.langfuse.com", "Other / self-hosted"],
+        ["Auto-detect", "https://cloud.langfuse.com", "https://us.cloud.langfuse.com", "Other / self-hosted"],
         index=0,
+        key="host_choice",
+        help="Auto-detect tries both EU and US Langfuse Cloud regions.",
     )
     if host_choice == "Other / self-hosted":
-        host = st.text_input("Langfuse host", value=ss.langfuse_host)
+        custom_host = st.text_input("Langfuse host", value=ss.langfuse_host, key="custom_host")
     else:
-        host = host_choice
+        custom_host = ""
 
-    pk = st.text_input("Public key (pk-lf-…)", type="password")
-    sk = st.text_input("Secret key (sk-lf-…)", type="password")
+    pk = st.text_input("Public key (pk-lf-…)", type="password", key="pk_input")
+    sk = st.text_input("Secret key (sk-lf-…)", type="password", key="sk_input")
 
     col_a, col_b = st.columns(2)
     if col_a.button("Connect", use_container_width=True):
         if not (pk and sk):
             st.error("Both keys are required.")
         else:
-            try:
-                lf = build_langfuse(pk, sk, host)
-                if not lf.auth_check():
-                    st.error("Authentication failed. Check your keys and region.")
-                else:
-                    ss.langfuse = lf
-                    ss.langfuse_host = host
-                    st.success("Connected ✅")
-            except Exception as exc:
-                st.error(f"Could not connect: {exc}")
+            lf, host_used, err = connect_langfuse(pk.strip(), sk.strip(), host_choice, custom_host)
+            if lf is None:
+                st.error(f"Could not connect: {err}")
+            else:
+                ss.langfuse = lf
+                ss.langfuse_host = host_used
+                st.success(f"Connected ✅ ({host_used})")
     if col_b.button("Disconnect", use_container_width=True):
         ss.langfuse = None
         st.rerun()
