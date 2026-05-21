@@ -146,8 +146,16 @@ def connect_langfuse(public_key: str, secret_key: str, host_choice: str,
     return None, None, last_error or "No host candidates to try."
 
 
-def trace_url(host: str, trace_id: str) -> str:
-    return f"{host.rstrip('/')}/trace/{trace_id}"
+def trace_url(langfuse: Langfuse | None, host: str, trace_id: str) -> str:
+    """Use the SDK helper so we get the correct /project/<id>/traces/<id> URL."""
+    if langfuse is not None:
+        try:
+            url = langfuse.get_trace_url(trace_id=trace_id)
+            if url:
+                return url
+        except Exception:
+            pass
+    return f"{host.rstrip('/')}/project/_/traces/{trace_id}"
 
 
 # --- Agent loop -------------------------------------------------------------
@@ -474,7 +482,7 @@ def render_assistant_turn(turn: dict) -> None:
     tid = turn.get("trace_id")
     host = turn.get("trace_host")
     if tid and host:
-        st.caption(f"trace `{tid}` — [open in Langfuse]({trace_url(host, tid)})")
+        st.caption(f"trace `{tid}` — [open in Langfuse]({trace_url(ss.langfuse, host, tid)})")
 
 
 for turn in ss.display:
