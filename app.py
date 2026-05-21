@@ -169,6 +169,25 @@ def lf_client():
         return get_client()
 
 
+def lf_call(method_name: str, **kwargs):
+    """Call a Langfuse client method if it exists; swallow + log otherwise.
+
+    Different Langfuse 3.x versions expose slightly different surface area
+    (update_current_trace, update_current_span, etc.). Be defensive so a
+    missing method never crashes the chat.
+    """
+    client = lf_client()
+    fn = getattr(client, method_name, None)
+    if fn is None:
+        print(f"[langfuse] client has no method '{method_name}' — skipping")
+        return None
+    try:
+        return fn(**kwargs)
+    except Exception as e:
+        print(f"[langfuse] {method_name} failed: {e}")
+        return None
+
+
 # --- Agent loop -------------------------------------------------------------
 
 @observe(name="tool-call")
@@ -236,11 +255,7 @@ def _run_tool(name: str, args: dict, registry: dict) -> dict:
         update_kwargs["level"] = level
         update_kwargs["status_message"] = f"{error_kind}: {error_message}"
 
-    try:
-        lf_client().update_current_span(**update_kwargs)
-    except Exception as upd_exc:
-        # Don't swallow silently — surface in stdout so it shows up in Streamlit Cloud logs.
-        print(f"[langfuse] update_current_span failed: {upd_exc}")
+    lf_call("update_current_span", **update_kwargs)
 
     return {
         "name": name, "input": args, "output": result, "ok": ok,
@@ -291,7 +306,8 @@ def run_agent(
     ]
 
     # Set trace-level attributes early so they apply to all child spans.
-    lf.update_current_trace(
+    lf_call(
+        "update_current_trace",
         name="customer-support-turn",
         session_id=session_id,
         user_id=user_id,
@@ -299,7 +315,8 @@ def run_agent(
         input={"user_message": user_message, "history_turns": len(history) // 2},
         metadata=base_metadata,
     )
-    lf.update_current_span(
+    lf_call(
+        "update_current_span",
         input={"user_message": user_message, "history_turns": len(history) // 2},
         metadata=base_metadata,
     )
@@ -364,11 +381,13 @@ def run_agent(
             "stopped_because": stop_reason,
         }
         full_metadata = {**base_metadata, "summary": summary, "tools_used": tools_used}
-        lf.update_current_span(
+        lf_call(
+            "update_current_span",
             output={"reply": final_text, "stop_reason": stop_reason},
             metadata=full_metadata,
         )
-        lf.update_current_trace(
+        lf_call(
+            "update_current_trace",
             name="customer-support-turn",
             input={"user_message": user_message, "history_turns": len(history) // 2},
             output={"reply": final_text, "stop_reason": stop_reason},
@@ -377,9 +396,12 @@ def run_agent(
             user_id=user_id,
             tags=tags,
         )
-        trace_id = lf.get_current_trace_id()
         try:
-            url = lf.get_trace_url(trace_id=trace_id)
+            trace_id = lf.get_current_trace_id() if hasattr(lf, "get_current_trace_id") else None
+        except Exception:
+            trace_id = None
+        try:
+            url = lf.get_trace_url(trace_id=trace_id) if trace_id and hasattr(lf, "get_trace_url") else None
         except Exception:
             url = None
 
